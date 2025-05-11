@@ -96,42 +96,54 @@
 
 ;; Calculate the amount to pay an employee for a period
 (define-read-only (calculate-payment (employee-id (string-ascii 36)) (period-end uint))
-  (let (
-    (employee (unwrap! (map-get? employees { employee-id: employee-id }) ERR_EMPLOYEE_NOT_FOUND))
-    (hours (get hours (get-hours employee-id period-end)))
-    (gross-amount (if (get is-hourly employee)
-                      (mul (get hourly-rate employee) hours)
-                      (get salary employee)))
-    (tax-amount (div (mul gross-amount (get tax-rate employee)) u10000))
-    (benefits-amount (div (mul gross-amount (get benefits-rate employee)) u10000))
-    (net-amount (- (- gross-amount tax-amount) benefits-amount))
+  (match (map-get? employees { employee-id: employee-id })
+    employee 
+      (let (
+        (hours (get hours (get-hours employee-id period-end)))
+        (gross-amount (if (get is-hourly employee)
+                        (* (get hourly-rate employee) hours)
+                        (get salary employee)))
+        (tax-amount (/ (* gross-amount (get tax-rate employee)) u10000))
+        (benefits-amount (/ (* gross-amount (get benefits-rate employee)) u10000))
+        (net-amount (- (- gross-amount tax-amount) benefits-amount))
+      )
+      (ok {
+        gross-amount: gross-amount,
+        tax-amount: tax-amount,
+        benefits-amount: benefits-amount,
+        net-amount: net-amount
+      }))
+    ERR_EMPLOYEE_NOT_FOUND
   )
-  {
-    gross-amount: gross-amount,
-    tax-amount: tax-amount,
-    benefits-amount: benefits-amount,
-    net-amount: net-amount
-  })
 )
 
-;; List all active employees
-(define-read-only (list-active-employees)
-  (filter active-employees (map-to-list employees))
+;; Data structure to maintain a list of employee IDs
+(define-data-var employee-count uint u0)
+
+(define-map employee-index
+  { index: uint }
+  { employee-id: (string-ascii 36) }
 )
 
-;; Helper function for filtering active employees
-(define-private (active-employees (entry {employee-id: (string-ascii 36), value: {
-    address: principal,
-    name: (string-ascii 50),
-    salary: uint,
-    hourly-rate: uint,
-    is-hourly: bool,
-    benefits-rate: uint,
-    tax-rate: uint,
-    last-paid: uint,
-    active: bool
-  }}))
-  (get active (get value entry))
+;; Get employee ID at a specific index
+(define-read-only (get-employee-at-index (index uint))
+  (match (map-get? employee-index { index: index })
+    entry (some (get employee-id entry))
+    none
+  )
+)
+
+;; Get employee count
+(define-read-only (get-employee-count)
+  (var-get employee-count)
+)
+
+;; Check if an employee is active
+(define-read-only (is-employee-active (employee-id (string-ascii 36)))
+  (match (map-get? employees { employee-id: employee-id })
+    employee (get active employee)
+    false
+  )
 )
 
 ;; Public functions
@@ -163,6 +175,7 @@
                  (and (not is-hourly) (> salary u0) (is-eq hourly-rate u0)))
              ERR_INVALID_AMOUNT)
     
+    ;; Add employee to the map
     (map-set employees
       { employee-id: employee-id }
       {
@@ -177,6 +190,16 @@
         active: true
       }
     )
+    
+    ;; Add employee ID to the index
+    (let ((current-count (var-get employee-count)))
+      (map-set employee-index 
+        { index: current-count }
+        { employee-id: employee-id }
+      )
+      (var-set employee-count (+ current-count u1))
+    )
+    
     (ok true)
   )
 )
@@ -241,6 +264,9 @@
         }
       )
     )
+    
+    ;; Note: We're not removing from the employee list, just marking as inactive
+    
     (ok true)
   )
 )
@@ -302,53 +328,60 @@
              ERR_PAYMENT_ALREADY_PROCESSED)
     
     (let (
-      (employee (unwrap! (map-get? employees { employee-id: employee-id }) ERR_EMPLOYEE_NOT_FOUND))
-      (payment-details (calculate-payment employee-id period-end))
-      (gross-amount (get gross-amount payment-details))
-      (tax-amount (get tax-amount payment-details))
-      (benefits-amount (get benefits-amount payment-details))
-      (net-amount (get net-amount payment-details))
-      (current-time (unwrap! (get-block-info? time (get-block-height)) ERR_INVALID_DATE))
+      (employee (unwrap-panic (map-get? employees { employee-id: employee-id })))
     )
-      ;; Check if employee is active
-      (asserts! (get active employee) ERR_NOT_AUTHORIZED)
+      ;; Calculate payment
+      (try! (calculate-payment employee-id period-end))
       
-      ;; Check contract has enough funds
-      (asserts! (>= (var-get contract-balance) net-amount) ERR_INSUFFICIENT_FUNDS)
-      
-      ;; Record the payment
-      (map-set payroll-history
-        { employee-id: employee-id, period-end: period-end }
-        {
-          gross-amount: gross-amount,
-          tax-amount: tax-amount,
-          benefits-amount: benefits-amount,
-          net-amount: net-amount,
-          timestamp: current-time,
-          paid: true
-        }
+      ;; Get calculated payment details
+      (let (
+        (payment-details (unwrap-panic (calculate-payment employee-id period-end)))
+        (gross-amount (get gross-amount payment-details))
+        (tax-amount (get tax-amount payment-details))
+        (benefits-amount (get benefits-amount payment-details))
+        (net-amount (get net-amount payment-details))
+        (current-time (unwrap-panic (get-block-info? time block-height)))
       )
-      
-      ;; Update employee's last paid timestamp
-      (map-set employees
-        { employee-id: employee-id }
-        {
-          address: (get address employee),
-          name: (get name employee),
-          salary: (get salary employee),
-          hourly-rate: (get hourly-rate employee),
-          is-hourly: (get is-hourly employee),
-          benefits-rate: (get benefits-rate employee),
-          tax-rate: (get tax-rate employee),
-          last-paid: current-time,
-          active: (get active employee)
-        }
+        ;; Check if employee is active
+        (asserts! (get active employee) ERR_NOT_AUTHORIZED)
+        
+        ;; Check contract has enough funds
+        (asserts! (>= (var-get contract-balance) net-amount) ERR_INSUFFICIENT_FUNDS)
+        
+        ;; Record the payment
+        (map-set payroll-history
+          { employee-id: employee-id, period-end: period-end }
+          {
+            gross-amount: gross-amount,
+            tax-amount: tax-amount,
+            benefits-amount: benefits-amount,
+            net-amount: net-amount,
+            timestamp: current-time,
+            paid: true
+          }
+        )
+        
+        ;; Update employee's last paid timestamp
+        (map-set employees
+          { employee-id: employee-id }
+          {
+            address: (get address employee),
+            name: (get name employee),
+            salary: (get salary employee),
+            hourly-rate: (get hourly-rate employee),
+            is-hourly: (get is-hourly employee),
+            benefits-rate: (get benefits-rate employee),
+            tax-rate: (get tax-rate employee),
+            last-paid: current-time,
+            active: (get active employee)
+          }
+        )
+        
+        ;; Update contract balance
+        (var-set contract-balance (- (var-get contract-balance) net-amount))
+        
+        (ok net-amount)
       )
-      
-      ;; Update contract balance
-      (var-set contract-balance (- (var-get contract-balance) net-amount))
-      
-      (ok net-amount)
     )
   )
 )
@@ -358,7 +391,7 @@
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
     (let (
-      (current-time (unwrap! (get-block-info? time (get-block-height)) ERR_INVALID_DATE))
+      (current-time (unwrap-panic (get-block-info? time block-height)))
     )
       ;; Set next payday
       (var-set next-payday (+ period-end (var-get pay-period-length)))
